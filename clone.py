@@ -9,8 +9,12 @@ from selenium.webdriver.chrome.service import Service
 from webdriver_manager.chrome import ChromeDriverManager
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.common.exceptions import TimeoutException, StaleElementReferenceException
+from selenium.common.exceptions import TimeoutException, StaleElementReferenceException, NoSuchElementException
 from selenium.webdriver.common.keys import Keys
+
+SCRIPT_VERSION = "24" # Use a string for the version number
+print(f"Starting Google Drive Clone Script Version: {SCRIPT_VERSION}")
+print("-" * 40) # Add a separator line for clarity
 
 # Configuration
 BASE_DOWNLOAD_DIR = os.path.abspath("./gdrive_backup")
@@ -41,12 +45,69 @@ driver = webdriver.Chrome(service=Service("/home/yena/Documents/2025/xiao-hu-sch
 driver.get("https://drive.google.com/drive/my-drive")
 input("Login and press Enter when Drive is ready...")
 
+# Global variable for the first PDF download attempt diagnostic
+_first_pdf_download_attempt = True
+
 # Pre-defined list of UI elements to fully skip
 SYSTEM_UI_ELEMENTS_TO_SKIP = [
     'owned by me', 'shared with me', 'recent', 'starred', 'trash', 
     'my drive', 'computers', 'shared drives', 'priority', 'workspaces',
     'sort direction', 'select', 'view', 'list view', 'grid view' 
 ]
+
+def collect_current_items_in_view(depth: int) -> list[dict]:
+    """
+    Scans the current view for file/folder items, filters out UI elements and shortcuts,
+    and returns a list of attribute dictionaries for processable items.
+    """
+    print(f"{'  ' * depth}Collecting items in current view...")
+    time.sleep(WAIT_TIME) # Allow time for items to load
+
+    current_view_elements = driver.find_elements(By.XPATH, '//div[@role="main"]//div[@data-tooltip]')
+    print(f"{'  ' * depth}Found {len(current_view_elements)} potential items in current view scan.")
+    
+    collected_items_attrs = []
+    for elem_idx, initial_elem in enumerate(current_view_elements):
+        try:
+            tooltip = initial_elem.get_attribute("data-tooltip")
+            label = initial_elem.get_attribute("aria-label")
+
+            if not label or not tooltip:
+                # print(f"{'  ' * depth}Skipping element with missing tooltip/label (index {elem_idx})")
+                continue
+
+            tooltip_lower_for_check = tooltip.lower()
+            label_lower_for_check = label.lower() if label else ""
+
+            # Filter UI elements
+            if any(skip_text in tooltip_lower_for_check or skip_text in label_lower_for_check for skip_text in SYSTEM_UI_ELEMENTS_TO_SKIP):
+                # print(f"{'  ' * depth}Skipping UI element during collection: {tooltip}")
+                continue
+            
+            # Filter Google Drive shortcuts
+            if tooltip.startswith("Google Drive shortcut:"):
+                # print(f"{'  ' * depth}Skipping Google Drive shortcut during collection: {label}")
+                continue
+            
+            clean_name = sanitize(label) # Sanitize after ensuring it's not a UI/shortcut
+            if not clean_name:
+                # print(f"{'  ' * depth}Skipping element with empty sanitized name (tooltip: {tooltip}, label: {label})")
+                continue
+            
+            collected_items_attrs.append({
+                "tooltip": tooltip,
+                "label": label,
+                "clean_name": clean_name
+            })
+        except StaleElementReferenceException:
+            print(f"{'  ' * depth}StaleElementReferenceException during item collection for element index {elem_idx}. Skipping this item.")
+            continue
+        except Exception as e:
+            print(f"{'  ' * depth}Unexpected error during item collection for element index {elem_idx}: {e}. Skipping this item.")
+            continue
+            
+    print(f"{'  ' * depth}Collected {len(collected_items_attrs)} processable items from current view.")
+    return collected_items_attrs
 
 def escape_xpath_value(value: str) -> str:
     """
@@ -82,8 +143,18 @@ def escape_xpath_value(value: str) -> str:
     parts = value.split("'")
     return "concat('" + "', \"'\", '".join(parts) + "')"
 
-def sanitize(name):
-    return "".join(c for c in name if c.isalnum() or c in " -_").strip()
+def sanitize(name: str) -> str:
+    processed_name = name
+    prefix1 = "Google Drive Folder: "
+    prefix2 = "Google Drive Folder "
+    
+    if processed_name.startswith(prefix1):
+        processed_name = processed_name[len(prefix1):]
+    elif processed_name.startswith(prefix2): # Use elif to ensure only one prefix is stripped if both somehow match (e.g. one is a substring of another)
+        processed_name = processed_name[len(prefix2):]
+        
+    # Existing sanitization logic
+    return "".join(c for c in processed_name if c.isalnum() or c in " -_").strip()
 
 def is_google_file(tooltip: str):
     """Check if item is a Google Workspace file"""
@@ -309,92 +380,124 @@ def export_google_file(file_elem, file_type, path, base_name):
 
 def download_non_google_file(file_elem, path, base_name):
     expected_path = os.path.join(path, base_name)
+    # 1. Skip-if-Exists check at the very beginning
     if os.path.exists(expected_path):
         print(f"SKIPPED (exists): {expected_path}")
         return
 
     ensure_download_dir(path)
+
+    # 2. Wait for file_elem to be Clickable
+    wait_clickable_item = WebDriverWait(driver, 20) # 20s timeout
+    clickable_file_elem = None
     try:
-        ActionChains(driver).context_click(file_elem).perform()
-        time.sleep(1)
-        download_btn = driver.find_element(By.XPATH, '//div[text()="Download"]')
-        download_btn.click()
-        time.sleep(WAIT_TIME)
+        print(f"  Waiting for non-Google file '{base_name}' to be clickable for context-menu (up to 20s).")
+        clickable_file_elem = wait_clickable_item.until(EC.element_to_be_clickable(file_elem))
+        print(f"  File element '{base_name}' is clickable for context-menu.")
+    except TimeoutException:
+        print(f"  Timeout (20s): File element '{base_name}' not clickable for context-menu. Skipping.")
+        return
+    except Exception as e: # Catch other potential errors like StaleElementReferenceException
+        print(f"  Error waiting for file '{base_name}' to be clickable: {e.__class__.__name__} - {e}. Skipping.")
+        return
+
+    try:
+        print(f"  Performing context-click on '{base_name}'.")
+        ActionChains(driver).context_click(clickable_file_elem).perform()
+        time.sleep(0.5) # Small pause for menu stability
+        
+        # Use keyboard navigation to select "Download"
+        actions = ActionChains(driver)
+        print(f"  Sending ARROW_DOWN to navigate context menu for '{base_name}'.")
+        # Assuming "Download" is the first or reliably reachable by one ARROW_DOWN.
+        # Multiple ARROW_DOWNs can be chained if needed: .send_keys(Keys.ARROW_DOWN).send_keys(Keys.ARROW_DOWN)
+        actions.send_keys(Keys.ARROW_DOWN).perform()
+        time.sleep(0.5) # Pause for selection to register
+
+        print(f"  Sending ENTER to select 'Download' from context menu for '{base_name}'.")
+        ActionChains(driver).send_keys(Keys.ENTER).perform() 
+        print("  Context menu 'Download' selected via keyboard.")
+        
+        # Check for and handle virus scan dialog
+        time.sleep(2) # Allow time for dialog to appear
+        virus_dialog_handled = False
+        try:
+            dialog_button_xpath = "//button[@name='ok' and normalize-space(text())='Download anyway']"
+            print(f"  Checking for virus scan dialog (up to {WAIT_TIME}s)...")
+            
+            dialog_confirm_button = WebDriverWait(driver, WAIT_TIME).until(
+                EC.element_to_be_clickable((By.XPATH, dialog_button_xpath))
+            )
+            print("  Virus scan dialog detected. Clicking 'Download anyway'.")
+            dialog_confirm_button.click()
+            virus_dialog_handled = True
+            print("  'Download anyway' clicked.")
+        except TimeoutException:
+            print("  No virus scan dialog detected, or 'Download anyway' button not found/clickable in time.")
+        except Exception as e_dialog:
+            print(f"  Exception while trying to handle virus dialog: {e_dialog.__class__.__name__} - {e_dialog}")
+
+        # Wait for download to complete
+        global _first_pdf_download_attempt
+        is_pdf = base_name.lower().endswith(".pdf") 
+
+        if is_pdf and _first_pdf_download_attempt:
+            print(f"  Performing extended wait (20s) for first PDF download: '{base_name}' (Dialog handled: {virus_dialog_handled})")
+            time.sleep(20)
+            _first_pdf_download_attempt = False
+        else:
+            effective_wait_time = WAIT_TIME # WAIT_TIME is global
+            print(f"  Waiting for download of '{base_name}' to initiate (Dialog handled: {virus_dialog_handled}) (up to {effective_wait_time + 2}s)...")
+            time.sleep(effective_wait_time + 2)
+        
         print(f"DOWNLOADED: {expected_path}")
+            
     except Exception as e:
-        print(f"Download error for {base_name}: {e}")
+        print(f"  Download error for '{base_name}': {e.__class__.__name__} - {e}")
 
 def process_folder(current_path, depth=0):
     """Process folder with depth tracking to prevent infinite recursion"""
+    print(f"{'  ' * depth}>>> Entering process_folder for path: {current_path} (Depth: {depth})")
     if depth > 10:  # Safety limit
-        print(f"WARNING: Maximum depth reached at {current_path}")
+        print(f"{'  ' * depth}WARNING: Maximum depth reached at {current_path}. Returning.")
         return
         
     os.makedirs(current_path, exist_ok=True)
     ensure_download_dir(current_path)
 
-    time.sleep(WAIT_TIME)
+    processed_item_clean_names_this_level = set()
     
-    initial_elements = driver.find_elements(By.XPATH, '//div[@role="main"]//div[@data-tooltip]')
-    items_to_process = []
+    print(f"{'  ' * depth}Performing initial scan of folder: {os.path.basename(current_path) if current_path else 'root'}")
+    current_items_to_process_attrs = collect_current_items_in_view(depth)
+    print(f"{'  ' * depth}Initial scan found {len(current_items_to_process_attrs)} processable items for {os.path.basename(current_path) if current_path else 'root'}.")
+        
+    item_idx = 0
+    while item_idx < len(current_items_to_process_attrs):
+        item_attrs = current_items_to_process_attrs[item_idx]
+        # Increment early, as 'continue' might be used, and for clarity with re-scan logic
+        item_idx += 1 
 
-    for elem_idx, initial_elem in enumerate(initial_elements):
-        try:
-            tooltip = initial_elem.get_attribute("data-tooltip")
-            label = initial_elem.get_attribute("aria-label")
-
-            if not label or not tooltip:
-                print(f"{'  ' * depth}Skipping element with missing tooltip/label (index {elem_idx})")
-                continue
-
-            # Skip UI elements early using the global list
-            tooltip_lower_for_check = tooltip.lower()
-            label_lower_for_check = label.lower() # Be careful if label can be None
-            if label is None: label_lower_for_check = ""
-
-            if any(skip_text in tooltip_lower_for_check or skip_text in label_lower_for_check for skip_text in SYSTEM_UI_ELEMENTS_TO_SKIP):
-                print(f"{'  ' * depth}Skipping UI element during initial scan: {tooltip}")
-                continue
-            
-            clean_name = sanitize(label)
-            if not clean_name: # Skip if name becomes empty after sanitization
-                print(f"{'  ' * depth}Skipping element with empty sanitized name (tooltip: {tooltip}, label: {label})")
-                continue
-
-            items_to_process.append({
-                "tooltip": tooltip,
-                "label": label,
-                "clean_name": clean_name
-            })
-        except StaleElementReferenceException:
-            print(f"{'  ' * depth}StaleElementReferenceException during attribute extraction for element index {elem_idx}. Skipping this item.")
-            continue
-        except Exception as e:
-            print(f"{'  ' * depth}Unexpected error during attribute extraction for element index {elem_idx}: {e}. Skipping this item.")
-            continue
-
-
-    for item_attrs in items_to_process:
+        clean_name = item_attrs["clean_name"]
         tooltip = item_attrs["tooltip"]
         label = item_attrs["label"]
-        clean_name = item_attrs["clean_name"]
+
+        if clean_name in processed_item_clean_names_this_level:
+            print(f"{'  ' * depth}Item '{clean_name}' (from list) already processed in this folder context. Skipping.")
+            continue
         
-        # Convert to lower for case-insensitive matching for skip checks
+        # Safeguard skip for UI/Shortcuts - should have been caught by collect_current_items_in_view
         tooltip_lower = tooltip.lower()
-        # Ensure label is not None before lowercasing for skip checks
         label_lower = label.lower() if label else ""
-
-        # 1. Explicitly skip known system UI elements based on the global list
         if any(skip_text in tooltip_lower or skip_text in label_lower for skip_text in SYSTEM_UI_ELEMENTS_TO_SKIP):
-            print(f"{'  ' * depth}Skipping system/UI element: {tooltip} (Label: {label})")
+            print(f"{'  ' * depth}Safeguard skip for UI element: '{clean_name}'. Should have been filtered by collector.")
+            processed_item_clean_names_this_level.add(clean_name)
+            continue
+        if tooltip.startswith("Google Drive shortcut:"):
+            print(f"{'  ' * depth}Safeguard skip for Shortcut: '{clean_name}'. Should have been filtered by collector.")
+            processed_item_clean_names_this_level.add(clean_name)
             continue
 
-        # 2. Handle Google Drive Shortcuts
-        if tooltip.startswith("Google Drive shortcut:"):
-            print(f"{'  ' * depth}Skipping Google Drive shortcut: {label} (Tooltip: {tooltip})")
-            continue
-        
-        print(f"{'  ' * depth}Processing item: {tooltip} (Label: {label})")
+        print(f"{'  ' * depth}Attempting to process item ({item_idx}/{len(current_items_to_process_attrs)}): '{clean_name}' in folder {os.path.basename(current_path) if current_path else 'root'}")
         
         sub_path = os.path.join(current_path, clean_name)
 
@@ -402,33 +505,125 @@ def process_folder(current_path, depth=0):
         try:
             xpath_safe_tooltip = escape_xpath_value(tooltip)
             xpath_safe_label = escape_xpath_value(label)
-            
             element_xpath = f"//div[@role='main']//div[@data-tooltip={xpath_safe_tooltip} and @aria-label={xpath_safe_label}]"
+            
+            # Extra logging for root items (depth == 0) when using the combined XPath
+            if depth == 0:
+                print(f"{'  ' * depth}Attempting to re-locate root item: '{clean_name}' using combined XPath: {element_xpath}")
+            
             current_element = driver.find_element(By.XPATH, element_xpath)
-        except Exception as e: 
-            print(f"{'  ' * depth}Could not re-locate element '{clean_name}' (Tooltip: {tooltip}, Label: {label}) using XPath '{element_xpath}': {e}. Skipping.")
-            continue
+            
+            if depth == 0:
+                print(f"{'  ' * depth}Successfully re-located root item: '{clean_name}'")
 
+        except NoSuchElementException: # Specific exception for not finding the element
+            print(f"{'  ' * depth}Could not re-locate element '{clean_name}' (Tooltip: {tooltip}, Label: {label}) using combined XPath.")
+            if depth == 0: # Perform diagnostic finds only for root items to limit log verbosity
+                print(f"{'  ' * depth}  DIAGNOSTIC FIND for root item '{clean_name}':")
+                try:
+                    elements_by_tooltip = driver.find_elements(By.XPATH, f"//div[@role='main']//div[@data-tooltip={xpath_safe_tooltip}]")
+                    if elements_by_tooltip:
+                        print(f"{'  ' * depth}    Found {len(elements_by_tooltip)} element(s) by tooltip only. First 5 labels: {[el.get_attribute('aria-label') for el in elements_by_tooltip[:5]]}")
+                    else:
+                        print(f"{'  ' * depth}    Found 0 elements by tooltip only.")
+                except Exception as diag_e_tooltip:
+                    print(f"{'  ' * depth}    Error during diagnostic find by tooltip: {diag_e_tooltip}")
+
+                try:
+                    elements_by_label = driver.find_elements(By.XPATH, f"//div[@role='main']//div[@aria-label={xpath_safe_label}]")
+                    if elements_by_label:
+                        print(f"{'  ' * depth}    Found {len(elements_by_label)} element(s) by label only. First 5 tooltips: {[el.get_attribute('data-tooltip') for el in elements_by_label[:5]]}")
+                    else:
+                        print(f"{'  ' * depth}    Found 0 elements by label only.")
+                except Exception as diag_e_label:
+                    print(f"{'  ' * depth}    Error during diagnostic find by label: {diag_e_label}")
+            continue # Skip to the next item_attrs in the list
+        except Exception as e: # Catch other potential exceptions (e.g., StaleElementReference)
+            print(f"{'  ' * depth}An unexpected error ('{e.__class__.__name__}') occurred while re-locating '{clean_name}': {e}. Skipping.")
+            continue
+            
         # Now determine if it's a folder or file (already skipped UI/shortcuts)
         if is_folder(tooltip, label): # is_folder also uses SYSTEM_UI_ELEMENTS_TO_SKIP as a safeguard
             try:
                 print(f"{'  ' * depth}> Entering folder: {clean_name}")
                 ActionChains(driver).double_click(current_element).perform()
                 time.sleep(WAIT_TIME + 2) # Wait for folder to load
-                process_folder(sub_path, depth + 1)
+                
+                process_folder(sub_path, depth + 1) # RECURSIVE CALL
+                
+                # After returning from sub-folder, mark this folder as processed for the current level
+                processed_item_clean_names_this_level.add(clean_name)
+                print(f"{'  ' * depth}Marked sub-folder '{clean_name}' as processed in {os.path.basename(current_path) if current_path else 'root'}.")
+
+                print(f"{'  ' * depth}Finished sub-folder: {clean_name}. Navigating back to parent: {os.path.basename(current_path) if current_path else 'root'}.")
                 driver.back()
-                time.sleep(WAIT_TIME) # Wait for previous folder to load
-            except StaleElementReferenceException:
-                print(f"{'  ' * depth}StaleElementReferenceException after navigating for folder {clean_name}. This might happen if the view changed too quickly.")
-            except Exception as e:
-                print(f"{'  ' * depth}Folder error for {clean_name}: {e}")
-                # Attempt to navigate back if an error occurs to stabilize state
+                
+                print(f"{'  ' * depth}  Waiting for parent folder's item list (grid/listbox) to be present after back (up to 15s)...")
                 try:
+                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//div[@role='grid' or @role='listbox']")))
+                    print(f"{'  ' * depth}  Parent folder's item list container is present after back.")
+                except TimeoutException:
+                    print(f"{'  ' * depth}  Timeout waiting for parent folder's item list container after back.")
+
+                print(f"{'  ' * depth}Refreshing view for parent folder: {os.path.basename(current_path) if current_path else 'root'}.")
+                driver.refresh()
+                time.sleep(WAIT_TIME) 
+                
+                print(f"{'  ' * depth}  Waiting for refreshed parent folder's item list (grid/listbox) to be present (up to 15s)...")
+                try:
+                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//div[@role='grid' or @role='listbox']")))
+                    print(f"{'  ' * depth}  Refreshed parent folder's item list container is present.")
+                except TimeoutException:
+                    print(f"{'  ' * depth}  Timeout waiting for refreshed parent folder's item list container.")
+                
+                print(f"{'  ' * depth}  Adding extra pause (WAIT_TIME={WAIT_TIME}s) for UI to settle after refresh.")
+                time.sleep(WAIT_TIME)
+                
+                print(f"{'  ' * depth}Re-scanning items in {os.path.basename(current_path) if current_path else 'root'} after returning from sub-folder and refreshing.")
+                current_items_to_process_attrs = collect_current_items_in_view(depth) # Re-assign
+                print(f"{'  ' * depth}Found {len(current_items_to_process_attrs)} items after refresh. Resetting loop for {os.path.basename(current_path) if current_path else 'root'}.")
+                item_idx = 0 # Reset index to re-iterate from the beginning of the *new* list
+                continue # Restart the while loop with the fresh list
+            except StaleElementReferenceException:
+                print(f"{'  ' * depth}StaleElementReferenceException during folder processing for '{clean_name}'. Attempting to recover by going back and rescanning.")
+                try:
+                    print(f"{'  ' * depth}Attempting to navigate back due to SERE in folder {clean_name}...")
+                    print(f"{'  ' * depth}Attempting to navigate back (due to SERE) from folder '{clean_name}'...")
                     driver.back()
-                    time.sleep(WAIT_TIME)
+                    print(f"{'  ' * depth}  Waiting for item list to stabilize after SERE recovery (up to 15s)...")
+                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//div[@role='grid' or @role='listbox']")))
+                    time.sleep(WAIT_TIME) # Allow further stabilization
+                    # After recovering by going back, we should re-scan the current folder.
+                    print(f"{'  ' * depth}Re-scanning items in {os.path.basename(current_path) if current_path else 'root'} after SERE recovery.")
+                    current_items_to_process_attrs = collect_current_items_in_view(depth)
+                    item_idx = 0 # Reset loop
+                    processed_item_clean_names_this_level.clear() # Clear processed for this level as we are re-scanning
+                    print(f"{'  ' * depth}Cleared processed items for this level due to SERE recovery and re-scan.")
+                    continue
                 except Exception as back_e:
-                    print(f"{'  ' * depth}Error trying to go back after folder error: {back_e}")
-        else:
+                    print(f"{'  ' * depth}Error trying to go back after SERE for '{clean_name}': {back_e}. Skipping item.")
+                    processed_item_clean_names_this_level.add(clean_name) # Mark as processed to avoid loop
+                    continue # Try next item in the list
+            except Exception as e:
+                print(f"{'  ' * depth}General folder processing error for '{clean_name}': {e}. Attempting to recover.")
+                try:
+                    print(f"{'  ' * depth}Attempting to navigate back (due to general error) from folder '{clean_name}'...")
+                    driver.back()
+                    print(f"{'  ' * depth}  Waiting for item list to stabilize after general error recovery (up to 15s)...")
+                    WebDriverWait(driver, 15).until(EC.presence_of_element_located((By.XPATH, "//div[@role='grid' or @role='listbox']")))
+                    time.sleep(WAIT_TIME)
+                    # After recovering, re-scan the current folder.
+                    print(f"{'  ' * depth}Re-scanning items in {os.path.basename(current_path) if current_path else 'root'} after general error recovery.")
+                    current_items_to_process_attrs = collect_current_items_in_view(depth)
+                    item_idx = 0 # Reset loop
+                    processed_item_clean_names_in_this_level.clear() # Clear processed for this level
+                    print(f"{'  ' * depth}Cleared processed items for this level due to general error recovery and re-scan.")
+                    continue
+                except Exception as back_e:
+                    print(f"{'  ' * depth}Error trying to go back after general error for '{clean_name}': {back_e}. Skipping item.")
+                    processed_item_clean_names_this_level.add(clean_name) # Mark as processed
+                    continue # Try next item
+        else: # It's a file
             file_type = get_google_file_type(tooltip)
             if file_type:
                 print(f"{'  ' * depth}> Exporting Google {file_type}: {clean_name}")
@@ -436,7 +631,11 @@ def process_folder(current_path, depth=0):
             else:
                 print(f"{'  ' * depth}> Downloading file: {clean_name}")
                 download_non_google_file(current_element, current_path, clean_name)
+            
+            processed_item_clean_names_this_level.add(clean_name)
+            print(f"{'  ' * depth}Marked file '{clean_name}' as processed in {os.path.basename(current_path) if current_path else 'root'}.")
 
+    print(f"{'  ' * depth}<<< Exiting process_folder for path: {current_path} (Depth: {depth})")
 # Start
 print("Starting Google Drive backup...")
 process_folder(BASE_DOWNLOAD_DIR)
